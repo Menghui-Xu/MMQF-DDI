@@ -11,8 +11,10 @@ import torch.nn.functional as F
 from rdkit import Chem
 from sklearn.metrics import roc_auc_score, auc, precision_recall_curve, f1_score, precision_score, recall_score
 from sklearn.preprocessing import label_binarize
+# 数据预处理，如 label_binarize 将多类标签转为二值矩阵
 from torch.utils.data import Dataset, DataLoader
 from model import MMQF
+import random
 
 '''Code for multi-class DDI prediction'''
 # 创建了一个 ArgumentParser 对象，用于处理命令行参数。
@@ -20,9 +22,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--gpu_id', type=int, default=0, help='which GPU card to use, 0/1/2/3 …')  # 服务器第几张卡
 parser.add_argument('--hidden_dim', type=int, default=512, help='num of hidden features')  ##隐藏层的维度，即神经网络中隐藏层的节点数。
 parser.add_argument('--out_dim', type=int, default=256, help='num of output features')  # 输出层的维度，即模型输出的特征数。
-parser.add_argument('--dropout', type=float, default=0.5,help='dropout rate')  # Dropout 率，用于防止过拟合的一种正则化技术，通过随机丢弃一部分神经元来实现。
-parser.add_argument('--rels', type=int, default=65,help='num of relations')  
-parser.add_argument('--n_epochs', type=int, default=400, help='num of epochs')  
+parser.add_argument('--dropout', type=float, default=0.5,help='dropout rate')
+parser.add_argument('--rels', type=int, default=65,help='num of relations')
+parser.add_argument('--n_epochs', type=int, default=400, help='num of epochs')
 parser.add_argument('--batch_size', type=int, default=2048, help='batch size')  # 批量大小，即每次训练时使用的样本数量
 parser.add_argument('--model', default='MMQF', type=str)  # 模型的类型，用于选择不同的模型架构
 parser.add_argument('--filename', type=str, default='result.csv', help='folder to save results.csv')
@@ -32,11 +34,25 @@ parser.add_argument('--temperature', type=float, default=0.2, help='对比学习
 parser.add_argument('--cl_alpha', type=float, default=0.7)
 parser.add_argument('--w_cl', type=float, default=0.1)#choices=[0.1,0.2]
 parser.add_argument('--lr', type=float, default=3e-3)#,choices=[3e-3,2e-3]
-parser.add_argument('--seed', type=int, default=0, help='Random seed for reproducibility')
+parser.add_argument('--seed', type=int, default=7, help='Random seed for reproducibility')
 parser.add_argument('--fold', type=int, default=0, help='Which fold to use (0-4)')
 parser.add_argument('--dataset', type=str, default='Deng', choices=['Deng','Ryu','Lin'], help='Dataset name')
 args = parser.parse_args()  # 解析命令行输入的参数，并将它们存储在 args 对象中，以便在脚本的其他部分使用。
 
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+
+
+set_seed(args.seed)
 
 # 把原来的 device 选择逻辑改成
 device = torch.device(f'cuda:{args.gpu_id}' if torch.cuda.is_available() else 'cpu')
@@ -47,9 +63,9 @@ print(f"数据保存文件为：{args.filename},seed为{args.seed}fold为{args.f
 # 3. 加载DDI数据
 # ============================
 
-print(f"读取数据: {args.dataset}/{args.seed}/{args.fold}/")
-train_df = pd.read_csv(f'{args.dataset}/{args.seed}/{args.fold}/train.csv')
-test_df = pd.read_csv(f'{args.dataset}/{args.seed}/{args.fold}/test.csv')
+print(f"读取数据: {args.dataset}/{args.fold}/")
+train_df = pd.read_csv(f'{args.dataset}/{args.fold}/train.csv')
+test_df = pd.read_csv(f'{args.dataset}/{args.fold}/test.csv')
 
 train_edges = train_df[['Drug1', 'Drug2']].values
 train_labels = train_df['Label'].values
@@ -134,14 +150,6 @@ def generate_edges_weighted_threshold(
 
     stats["final_edges"] = len(edges_set)
 
-    print(f"\n阈值加权融合选边:")
-    print(f"  - graph_alpha: {graph_alpha}")
-    print(f"  - min_sim: {min_sim}")
-    print(f"  - 过滤自环: {stats['filtered_by_self_loop']}")
-    print(f"  - 过滤已有DDI边: {stats['filtered_by_ddi']}")
-    print(f"  - 阈值过滤: {stats['filtered_by_threshold']}")
-    print(f"  - 最终保留边: {stats['final_edges']}")
-
     if len(edges_set) == 0:
         return torch.empty((0, 2), dtype=torch.long), stats
 
@@ -153,7 +161,6 @@ def build_unified_graph(train_edges,train_labels,sim_edges,num_ddi_relations):
     """构建统一异构图"""
     # 原始无向DDI边
     ddi_edges = train_edges
-    # 为PyG消息传播补充反向边
     ddi_edges_rev = train_edges[:, [1, 0]]
     ddi_types = train_labels
     ddi_types_rev = train_labels
@@ -174,8 +181,6 @@ def build_unified_graph(train_edges,train_labels,sim_edges,num_ddi_relations):
             else np.empty((0, 2), dtype=np.int64))
 
     if len(sim_edges_np) > 0:
-        # 相似边生成阶段已经包含(A,B)和(B,A)
-        # 只进行有向边去重，不再构造sim_edges_rev
         sim_edges_np = np.unique(sim_edges_np.astype(np.int64),axis=0)
 
         sim_types = np.full(len(sim_edges_np),num_ddi_relations,dtype=np.int64)
@@ -223,7 +228,7 @@ def build_original_graph(train_edges, train_labels, num_ddi_relations):
     return edge_index, edge_type
 # 构建原始图
 original_edge_index, original_edge_type = build_original_graph(train_edges, train_labels, num_ddi_relations=args.rels)
-all_real_edges = np.vstack([train_edges, test_edges])
+all_real_edges = np.vstack([train_edges])
 
 new_edges_sim, _ = generate_edges_weighted_threshold(
         sem_similarity_matrix=sim_mat_chem,
@@ -308,13 +313,6 @@ def load_brics_data(brics_pkl_path=f'{args.dataset}/brics_fragments_data.pkl',
             'edge_attr': graph['edge_attr'].clone()
         })
 
-    print(f"\nBRICS数据加载完成:")
-    print(f"  - 药物数: {num_drugs}")
-    print(f"  - 唯一片段数: {len(frag_to_idx)}")
-    print(f"  - 最大片段数: {max_fragments}")
-    print(f"  - 节点特征维度: {node_feat_dim}")
-    print(f"  - 边特征维度: {edge_feat_dim}")
-    print(f"  - 有效片段占比: {fragment_mask_matrix.sum().item() / (num_drugs * max_fragments):.2%}")
 
     return {
         'drug_list': drug_list,
@@ -347,11 +345,6 @@ for graph in brics_data['frag_graphs']:
         'edge_attr': graph['edge_attr'].to(device)
     })
 
-print(f"\n✅ 所有数据已移动到 {device}")
-print(f"  - fragment_indices: {fragment_indices_matrix.shape}")
-print(f"  - fragment_idfs: {fragment_idfs_matrix.shape}")
-print(f"  - fragment_mask: {fragment_mask_matrix.shape}")
-print(f"  - GIN图数量: {len(frag_graphs_gpu)}")
 
 
 class DDIDataset(Dataset):
@@ -373,7 +366,10 @@ class DDIDataset(Dataset):
 train_dataset = DDIDataset(train_edges, train_labels)
 test_dataset = DDIDataset(test_edges, test_labels)
 
-train_loader = DataLoader(dataset=train_dataset, shuffle=True, batch_size=args.batch_size)
+generator = torch.Generator()
+generator.manual_seed(args.seed)
+
+train_loader = DataLoader(dataset=train_dataset,shuffle=True,batch_size=args.batch_size,generator=generator)
 test_loader = DataLoader(dataset=test_dataset, batch_size=args.batch_size)
 
 
@@ -458,6 +454,7 @@ def train_():
 # y_true = np.array([[0, 1], [1, 0], [0, 1]])  # 2个类别的真实标签
 # y_score = np.array([[0.2, 0.8], [0.6, 0.4all.csv], [0.3, 0.7]]) # 预测概率
 def roc_aupr_score(y_true, y_score, average="macro"):
+    # 计算二分类问题的ROC-AUC和PR-AUC分数
     def _binary_roc_aupr_score(y_true, y_score):
         precision, recall, _ = precision_recall_curve(y_true, y_score)
         return auc(recall, precision)

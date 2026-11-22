@@ -410,13 +410,6 @@ class GINFragmentEncoder_JK1(nn.Module):
             )
         )
 
-        # ====================================================
-        # 4. Jumping Knowledge投影
-        # ====================================================
-        # 第一层图表示和第二层图表示进行拼接：
-        # hidden_dim + hidden_dim = hidden_dim * 2
-        # 再投影为output_dim
-        # ====================================================
 
         self.proj = nn.Sequential(
             nn.Linear(hidden_dim * 2, output_dim),
@@ -465,14 +458,6 @@ class GINFragmentEncoder_JK1(nn.Module):
         h2 = F.relu(h2)
         h2 = self.dropout(h2)
 
-        # ====================================================
-        # 对每个片段图分别进行全局平均池化
-        # ====================================================
-        # frag_batch_index记录每个原子属于哪个片段图。
-        #
-        # h1_pool: [num_fragments, hidden_dim]
-        # h2_pool: [num_fragments, hidden_dim]
-        # ====================================================
 
         h1_pool = global_mean_pool(
             h1,
@@ -485,12 +470,6 @@ class GINFragmentEncoder_JK1(nn.Module):
             self.frag_batch_index,
             size=self.num_frags
         )
-
-        # ====================================================
-        # Jumping Knowledge
-        # ====================================================
-        # 同时保留第一层和第二层GIN信息
-        # ====================================================
 
         h_jk = torch.cat(
             [h1_pool, h2_pool],
@@ -602,11 +581,7 @@ class MMQF(nn.Module):
 
         triples = triples.long()
 
-        # h = node_emb_proj[triples[:, 0]]
-        # t = node_emb_proj[triples[:, 1]]
-        # output = self.predictor(h, t)
-        #
-        # return output, (z_sem, z_graph, z_frag)
+
         h = node_emb_proj[triples[:, 0]]
         t = node_emb_proj[triples[:, 1]]
 
@@ -618,3 +593,73 @@ class MMQF(nn.Module):
 
 
 
+class MMQF_cold(nn.Module):
+    def __init__(self, args, frag_graphs, enzyme_sim, target_sim,
+                 node_feat_dim=6, edge_feat_dim=5,
+                 frag_hidden_dim=128, frag_output_dim=256,
+                 cross_hidden_dim=256, cross_heads=4, num_queries=4):
+        super().__init__()
+        self.semantic_encoder = SemanticEncoderV3_Dense(
+            input_dim=args.smiles_input_dim, hidden_dim=args.hidden_dim, dropout=args.dropout
+        )
+        self.fragment_encoder = GINFragmentEncoder_JK1(
+            frag_graphs=frag_graphs, node_feat_dim=node_feat_dim, edge_feat_dim=edge_feat_dim,
+            hidden_dim=frag_hidden_dim, output_dim=frag_output_dim, dropout=args.dropout
+        )
+        self.cross_fusion = MultiQueryCrossAttentionFusion(
+            sem_dim=1792, frag_dim=frag_output_dim, hidden_dim=cross_hidden_dim,
+            num_heads=cross_heads, num_queries=num_queries, dropout=args.dropout
+        )
+
+        nn.Linear(1792, 1792)
+        self.projection = nn.Sequential(
+            nn.Linear(1792, 512), nn.ELU(), nn.Dropout(args.dropout),
+            nn.Linear(512, args.out_dim), nn.LayerNorm(args.out_dim)
+        )
+        self.predictor = EnhancedPairPredictor(
+            input_dim=args.out_dim, num_classes=args.rels, dropout=args.dropout
+        )
+        self.sem_cons_proj = nn.Sequential(nn.Linear(1792, 512), nn.ELU(), nn.Linear(512, 256))
+        self.graph_cons_proj = nn.Sequential(nn.Linear(1792, 512), nn.ELU(), nn.Linear(512, 256))
+        self.frag_cons_proj = nn.Sequential(nn.Linear(frag_output_dim, 512), nn.ELU(), nn.Linear(512, 256))
+
+        self.register_buffer('enzyme_sim', enzyme_sim.float())
+        self.register_buffer('target_sim', target_sim.float())
+        self.enzyme_encoder = nn.Sequential(
+            nn.Linear(enzyme_sim.shape[1], 128), nn.ELU(), nn.Dropout(args.dropout),
+            nn.Linear(128, 64), nn.LayerNorm(64)
+        )
+        self.target_encoder = nn.Sequential(
+            nn.Linear(target_sim.shape[1], 128), nn.ELU(), nn.Dropout(args.dropout),
+            nn.Linear(128, 64), nn.LayerNorm(64)
+        )
+        nn.Linear(args.out_dim + 128, args.out_dim)
+        self.predictor.predictor[0] = nn.Linear(args.out_dim * 4 + 512, 512)
+
+    def _pair_features(self, node_emb, triples):
+        h = node_emb[triples[:, 0]]
+        t = node_emb[triples[:, 1]]
+        return torch.cat([h, t, torch.abs(h - t), h * t], dim=-1)
+
+    def forward(self, edge_index, edge_type, smiles_matrix,
+                fragment_indices, fragment_idfs, fragment_mask, triples):
+        h_sem, _ = self.semantic_encoder(smiles_matrix)
+        frag_tokens, h_frag = self.fragment_encoder(
+            fragment_indices, fragment_idfs, fragment_mask
+        )
+        h_fused, _ = self.cross_fusion(h_sem, frag_tokens, fragment_mask)
+        node_emb = self.projection(h_fused)
+        z_sem = self.sem_cons_proj(h_sem)
+        z_graph = self.graph_cons_proj(h_fused)
+        z_frag = self.frag_cons_proj(h_frag)
+
+        triples = triples.long()
+        num_drugs = node_emb.shape[0]
+        enzyme_feat = self.enzyme_encoder(self.enzyme_sim[:num_drugs])
+        target_feat = self.target_encoder(self.target_sim[:num_drugs])
+        pair_feat = torch.cat([
+            self._pair_features(node_emb, triples),
+            self._pair_features(enzyme_feat, triples),
+            self._pair_features(target_feat, triples)
+        ], dim=-1)
+        return self.predictor.predictor(pair_feat), (z_sem, z_graph, z_frag, None, None)
