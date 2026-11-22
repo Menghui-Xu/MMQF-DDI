@@ -1,83 +1,81 @@
 # MMQF-DDI
 
-**Multi-Scale Molecular Query Fusion for Drug–Drug Interaction Prediction**
+Multi-Scale Molecular Query Fusion for Drug–Drug Interaction Prediction.
 
-MMQF-DDI predicts multi-class drug–drug interactions (DDIs) by combining global molecular semantics, local BRICS fragment representations, and relational graph information. Its main components are:
+The main model (`MMQF`) combines MolFormer features, BRICS fragment encoding, multi-query cross-attention, an augmented relation graph, and cross-view contrastive learning. The cold-start model (`MMQF_cold`) uses molecular, target, and enzyme representations and performs prediction without DDI graph propagation.
 
-- Offline MolFormer molecular features and a densely connected semantic encoder.
-- A JK-GIN encoder for BRICS fragment graphs.
-- Semantic-conditioned multi-query cross-attention for global–local fusion.
-- A similarity-augmented drug graph and R-GCN for relational learning.
-- Semantic–graph and fragment–graph contrastive objectives, together with a drug-pair classifier.
+## Environment
 
-This README describes the code and data included in this directory. The commands below run the full model through `main.py`.
-
-## 1. Environment setup
-
-The supplied configuration targets Linux with Conda and an NVIDIA GPU. It specifies Python 3.8.20, PyTorch 2.4.0, CUDA runtime 12.4, PyTorch Geometric 2.5.3, and RDKit 2024.3.5. Use an NVIDIA driver compatible with the CUDA 12.4 runtime. A separate system CUDA toolkit is not required for the supplied PyTorch packages.
-
-From the repository root, run:
+The supplied environment targets Linux and an NVIDIA GPU compatible with CUDA 12.4.
 
 ```bash
-conda env create -n MMQF -f environment_server.yaml
+conda env create -f environment_server.yaml
 conda activate MMQF
 ```
 
-The explicit `-n MMQF` overrides the environment name stored in the YAML file. Use the same name in any launcher scripts.
+Core versions: Python 3.8.20, PyTorch 2.4.0, PyTorch Geometric 2.5.3, RDKit 2024.3.5. Run commands from the repository root. Precomputed molecular features and fragment data are included, so MolFormer inference is not required to run the experiments.
 
-Verify the main dependencies:
+## Data
 
-```bash
-python -c "import torch, torch_geometric, rdkit; print('PyTorch:', torch.__version__); print('PyG:', torch_geometric.__version__); print('CUDA available:', torch.cuda.is_available()); print('CUDA runtime:', torch.version.cuda)"
-```
-
-The YAML pins MKL and Intel OpenMP to avoid the `libtorch_cpu.so: undefined symbol: iJIT_NotifyEvent` import error. Preserve these pins when recreating the environment.
-
-## 2. Repository structure and data
+Both datasets include five precomputed folds. CSV files use zero-based `Drug1`, `Drug2`, and `Label` indices.
 
 ```text
-MMQF/
-├── main.py                         # Training and evaluation entry point
-├── model.py                        # Model definitions
-├── Run_00.py                       # Local batch launcher;
-├── environment_server.yaml         # Conda environment
-├── Deng/
-│   ├── 0/
-│   │   ├── 0/ ... 4/               # Five provided folds
-│   │   │   ├── train.csv
-│   │   │   └── test.csv
-│   ├── ddi_class_65.csv
-│   ├── drug_listxiao.csv
-│   └── ...                         # Precomputed inputs listed below
-└── Lin/
-    ├── 0/
-    │   ├── 0/ ... 4/
-    │   │   ├── train.csv
-    │   │   └── test.csv
-    ├── DDI_1258.csv
-    ├── drug_list_1258.csv
-    └── ...
+Deng/ or Lin/
+  0/ ... 4/                 # main experiment: train.csv, test.csv
+  Molformer_smiles_features.pt
+  molformer_sim_matrix.csv
+  brics_weighted_similarity_matrix.npy
+  chem_Jacarrd_sim.csv
+  enzyme_Jacarrd_sim.csv
+  target_Jacarrd_sim.csv
+  brics_fragments_data.pkl
+  fragment_graph_data.pkl
+  drug_fragment_indices.pkl
+cold/Deng/ or cold/Lin/
+  0/ ... 4/                 # train.csv, test_task2.csv, test_task3.csv
 ```
 
-| Dataset | Drugs in the feature set | DDI classes |
-|---|---:|---:|
-| Deng | 572 | 65 |
-| Lin | 1,258 | 100 |
+Keep the supplied drug index ordering consistent across DDI records, molecular features, similarity matrices, and fragment data. Deng has 65 event classes and Lin has 100.
 
-Each split CSV contains `Drug1`, `Drug2`, and `Label`. Drug indices are zero-based and must match the row ordering of the molecular features, similarity matrices, and per-drug fragment inputs. Class labels range from `0` to `C - 1`.
+**Data issue to resolve before reporting results:** the supplied Lin main-experiment splits contain 5, 4, 4, 4, and 2 identical DDI records shared between training and testing in folds 0–4. Deduplicate the source records and regenerate the folds before using these splits for an independent evaluation. The supplied splits have not been altered during code review.
 
-`main.py` requires the following files inside each dataset directory:
+## Main experiment
 
-| File | Purpose |
-|---|---|
-| `Molformer_smiles_features.pt` | Offline molecular features, with one row per drug |
-| `molformer_sim_matrix.csv` | MolFormer cosine similarity matrix |
-| `brics_weighted_similarity_matrix.npy` | IDF-weighted BRICS Jaccard similarity matrix |
-| `brics_fragments_data.pkl` | Per-drug fragments and fragment IDF weights |
-| `fragment_graph_data.pkl` | Fragment graphs and their exact vocabulary/index mapping |
-| `drug_fragment_indices.pkl` | Per-drug indices into that fragment vocabulary |
-| `<seed>/<fold>/train.csv` | Training drug pairs |
-| `<seed>/<fold>/test.csv` | Test drug pairs |
+```bash
+python Run.py
+```
 
-The necessary precomputed inputs are included, so no preprocessing or MolFormer model download is required to run the supplied experiments. Keep these files together and preserve their indexing. 
+This runs five folds on Deng and Lin using the dataset-specific settings in `Run.py`. Change `gpu` or `datasets` there as needed. Results are appended to `result/Deng_five_fold.csv` and `result/Lin_five_fold.csv`.
 
+For one Deng fold with the same settings:
+
+```bash
+python main.py --dataset Deng --rels 65 --fold 0 --seed 7 --gpu_id 0 --n_epochs 400 --batch_size 2048 --dropout 0.5 --graph_alpha 0.6 --min_sim 0.6 --temperature 0.2 --cl_alpha 0.7 --w_cl 0.1 --lr 0.002
+```
+
+The relation graph uses training DDI edges. Auxiliary edges are constructed from the weighted MolFormer and BRICS similarities, with overlap filtering based on training DDI pairs.
+
+## Cold-start experiment
+
+```bash
+python Run_cold.py
+```
+
+This runs five folds on both datasets. Each fold trains once on known–known drug pairs, then separately evaluates S1 / Task 2 (known–unseen) and S2 / Task 3 (unseen–unseen). The held-out drug subsets are mutually disjoint across the five folds.
+
+For the default `gpu=0`, results are appended to:
+
+```text
+result/0_Deng_cold_task2.csv
+result/0_Deng_cold_task3.csv
+result/0_Lin_cold_task2.csv
+result/0_Lin_cold_task3.csv
+```
+
+A single-fold run uses `main_cold.py` with the same parameter arguments shown above. Its default model is `MMQF_cold`.
+
+## Outputs and evaluation
+
+Scripts evaluate the final training epoch. Each CSV row contains the model, seed, fold, settings, and six metrics: ACC, micro AUPRC, micro AUROC, macro F1, macro precision, and macro recall. AUPRC is computed by trapezoidal integration of the precision–recall curve. Report the mean over the five final-fold rows. Re-running a launcher appends additional rows to the same files.
+
+The default training seed is 7; `--seed` controls model initialization and training-data shuffling. Contrastive learning uses the representations of all drugs at each training iteration, while the classification batch size counts drug pairs. Cold-start evaluation allows access to the held-out drugs' unlabeled molecular and attribute features during training.
